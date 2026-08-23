@@ -16,6 +16,7 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { AgentCycleUpdateAction } from "../../core/cycle.js";
 import type { InputSource } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { CustomMessage } from "../../core/messages.js";
@@ -67,8 +68,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 20 lets cancellation target a prompt the session owns but has not started.
 // Revision 21 adds capability-gated, session-scoped ACP MCP server replacement.
 // Revision 22 scopes ACP MCP replacement and cleanup to a connection owner.
-export const DAEMON_SCHEMA_REVISION = 22;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-22-4d515169dc6b";
+// Revision 23 adds capability-gated persistent Cycle automation commands and job state.
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-e210b0b326c9";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -113,7 +115,8 @@ export type DaemonServerCapability =
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
-	| "acp_mcp_servers";
+	| "acp_mcp_servers"
+	| "cycle_automation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -158,6 +161,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
+	"cycle_automation",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -591,6 +595,15 @@ export type DaemonCommand =
 			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
+	| { id?: string; type: "cycle_get"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "cycle_set";
+			activeSessionId: string;
+			schedule: string;
+			promoteOwnedSession?: boolean;
+	  }
+	| { id?: string; type: "cycle_update"; activeSessionId: string; action: AgentCycleUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
@@ -712,6 +725,11 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	minSchemaRevision: 19,
 	capability: "session_input_pause",
 } as const;
+const CYCLE_AUTOMATION_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 23,
+	capability: "cycle_automation",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -774,6 +792,9 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	heartbeat_get: LEGACY_DAEMON_COMMAND,
 	heartbeat_set: LEGACY_DAEMON_COMMAND,
 	heartbeat_update: LEGACY_DAEMON_COMMAND,
+	cycle_get: CYCLE_AUTOMATION_COMMAND,
+	cycle_set: CYCLE_AUTOMATION_COMMAND,
+	cycle_update: CYCLE_AUTOMATION_COMMAND,
 	set_model: LEGACY_DAEMON_COMMAND,
 	cycle_model: LEGACY_DAEMON_COMMAND,
 	set_scoped_models: LEGACY_DAEMON_COMMAND,
@@ -1125,6 +1146,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_get",
+	"cycle_get",
 	"get_session_context",
 	"get_session_tree",
 	"get_user_messages_for_forking",

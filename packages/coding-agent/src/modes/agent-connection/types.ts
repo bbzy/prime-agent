@@ -12,6 +12,7 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { AgentCycleUpdateAction } from "../../core/cycle.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { InputSource } from "../../core/extensions/types.js";
 import type { GoalState } from "../../core/goals.js";
@@ -681,6 +682,10 @@ export interface AgentConnection {
 		deliveryMode?: AgentHeartbeatDeliveryMode,
 	): Promise<AgentCronJob>;
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
+	supportsCycleAutomation?(): boolean;
+	getCycle?(): Promise<AgentCronJob | undefined>;
+	setCycle?(schedule: string): Promise<AgentCronJob>;
+	updateCycle?(action: AgentCycleUpdateAction): Promise<AgentCronJob | undefined>;
 	sendAgentMessage(targetActiveSessionId: string, message: string): Promise<AgentSessionMessageReceipt>;
 	getAgentMessageStatus(): Promise<AgentSessionMessageSafetyStatus>;
 	pauseAgentMessages(): Promise<AgentSessionMessageSafetyStatus>;

@@ -82,12 +82,21 @@ import {
 	type AgentHeartbeatManagementAction,
 	type AgentHeartbeatUpdateAction,
 	DEFAULT_HEARTBEAT_SCHEDULE,
+	isCycleCronJob,
 	isHeartbeatCronJob,
 	normalizeHeartbeatDeliveryMode,
 	normalizeHeartbeatSchedule,
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
+import {
+	type AgentCycleState,
+	type AgentCycleUpdateAction,
+	createAgentCyclePrompt,
+	isAgentCycleReflectionRound,
+	observeAgentCycleRound,
+} from "../../core/cycle.js";
+import { HEARTBEAT_PROMPT_CUSTOM_TYPE, type HeartbeatPromptDetails } from "../../core/messages.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
@@ -298,6 +307,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"heartbeat_get",
 	"heartbeat_set",
 	"heartbeat_update",
+	"cycle_get",
+	"cycle_set",
+	"cycle_update",
 	"set_model",
 	"cycle_model",
 	"set_scoped_models",
@@ -1786,6 +1798,9 @@ export class AgentDaemon {
 			return "skipped";
 		}
 		const session = state.runtime.session;
+		if (isCycleCronJob(runnableJob)) {
+			return this.runCycleJob(state, runnableJob, requirePersistedJob);
+		}
 		const isAgentMessagePromptInProgress =
 			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
 			this.agentMessagePreparingTargets.has(state.activeSessionId);
@@ -1841,6 +1856,59 @@ export class AgentDaemon {
 			false,
 		);
 		return didPrompt ? undefined : "skipped";
+	}
+
+	private async runCycleJob(
+		state: ActiveSessionState,
+		job: AgentCronJob,
+		requirePersistedJob: boolean,
+	): Promise<"skipped" | undefined> {
+		const session = state.runtime.session;
+		await session.waitForIdle();
+		const getCurrentJob = (): (AgentCronJob & { source: "cycle"; cycle: AgentCycleState }) | undefined => {
+			const current = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
+			return current &&
+				isCycleCronJob(current) &&
+				this.isCronJobRunnableForState(current, state, requirePersistedJob)
+				? current
+				: undefined;
+		};
+		const current = getCurrentJob();
+		if (!current) return "skipped";
+		const reflection = isAgentCycleReflectionRound(current.cycle);
+		const roundStartedAt = Date.now();
+		const promptJob = { ...current, prompt: createAgentCyclePrompt(current) };
+		const didPrompt = await this.promptHeartbeatWithAgentMessagePreparingGuard(
+			state,
+			promptJob,
+			{
+				streamingBehavior: "followUp",
+				followUpQueueKey: `cycle:${current.id}`,
+				source: "rpc",
+			},
+			() => {
+				const runnable = getCurrentJob();
+				return runnable ? { ...runnable, prompt: createAgentCyclePrompt(runnable) } : undefined;
+			},
+		);
+		if (!didPrompt) return "skipped";
+		const messages = session.messages;
+		let promptIndex = -1;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index]!;
+			if (message.role !== "custom" || message.customType !== HEARTBEAT_PROMPT_CUSTOM_TYPE) continue;
+			const details = message.details as HeartbeatPromptDetails | undefined;
+			if (details?.jobId === current.id && details.source === "cycle") {
+				promptIndex = index;
+				break;
+			}
+		}
+		const roundMessages =
+			promptIndex >= 0
+				? messages.slice(promptIndex + 1)
+				: messages.filter((message) => message.timestamp >= roundStartedAt);
+		this.cronStore.recordCycleRound(current.id, observeAgentCycleRound(roundMessages, reflection));
+		return undefined;
 	}
 
 	private getRunnableCronJob(jobId: string): AgentCronJob | undefined {
@@ -2023,6 +2091,46 @@ export class AgentDaemon {
 		}
 		this.cronScheduler.wake();
 		return job;
+	}
+
+	private createCycleForState(state: ActiveSessionState, schedule: string): AgentCronJob {
+		const session = state.runtime.session;
+		const sessionFile = session.sessionFile;
+		if (!sessionFile) {
+			throw new Error("Cycle automation requires a persisted session file");
+		}
+		const previousCycle = this.cronStore.getCycle(state.activeSessionId);
+		const job = this.cronStore.createCycle({
+			activeSessionId: state.activeSessionId,
+			sessionId: session.sessionId,
+			sessionFile,
+			cwd: state.runtime.cwd,
+			runtimeKind: state.runtime.metadata.kind,
+			scheduleText: schedule,
+		});
+		if (previousCycle) {
+			state.runtime.session.removeQueuedFollowUp(`cycle:${previousCycle.id}`);
+		}
+		this.cronScheduler.wake();
+		return job;
+	}
+
+	private updateCycleForState(state: ActiveSessionState, action: AgentCycleUpdateAction): AgentCronJob | undefined {
+		const previous = this.cronStore.getCycle(state.activeSessionId);
+		const job = this.cronStore.updateCycle(state.activeSessionId, action);
+		if (previous && action !== "resume" && action !== "run") {
+			state.runtime.session.removeQueuedFollowUp(`cycle:${previous.id}`);
+		}
+		if (job) this.cronScheduler.wake();
+		return job;
+	}
+
+	private pauseCycleForUserIntervention(state: ActiveSessionState): void {
+		const current = this.cronStore.getCycle(state.activeSessionId);
+		if (!current || current.status !== "active") return;
+		this.cronStore.pauseCycleForUserIntervention(state.activeSessionId);
+		state.runtime.session.removeQueuedFollowUp(`cycle:${current.id}`);
+		this.cronScheduler.wake();
 	}
 
 	private createRlmHeartbeatForState(
@@ -4105,6 +4213,9 @@ export class AgentDaemon {
 					clearAdmission();
 					throw error;
 				}
+				if (command.type === "prompt_and_wait" || command.agentMessageId === undefined) {
+					this.pauseCycleForUserIntervention(state);
+				}
 				const options: PromptOptions = {
 					content: command.content,
 					images: command.images,
@@ -4182,6 +4293,9 @@ export class AgentDaemon {
 
 			case "steer": {
 				const state = this.getBoundSessionState(command.activeSessionId);
+				if (command.agentMessageId === undefined && command.expandPromptTemplates !== false) {
+					this.pauseCycleForUserIntervention(state);
+				}
 				if (command.expandPromptTemplates === false) {
 					await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -4203,6 +4317,9 @@ export class AgentDaemon {
 
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
+				if (command.agentMessageId === undefined && command.expandPromptTemplates !== false) {
+					this.pauseCycleForUserIntervention(state);
+				}
 				let queued = true;
 				let admitted = true;
 				if (command.expandPromptTemplates === false) {
@@ -4298,6 +4415,7 @@ export class AgentDaemon {
 
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
+				this.pauseCycleForUserIntervention(state);
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
 			}
@@ -4642,6 +4760,7 @@ export class AgentDaemon {
 
 			case "abort_and_clear_queue": {
 				const state = this.getSessionState(command.activeSessionId);
+				this.pauseCycleForUserIntervention(state);
 				const queue = state.runtime.session.clearQueue();
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort_and_clear_queue", queue);
@@ -4649,6 +4768,9 @@ export class AgentDaemon {
 
 			case "cron_list": {
 				const jobs = this.cronStore.list().filter((job) => {
+					if (job.source === "cycle") {
+						return false;
+					}
 					if (!command.includeInactive && job.status !== "active" && job.status !== "paused") {
 						return false;
 					}
@@ -4713,6 +4835,24 @@ export class AgentDaemon {
 				return success(command.id, "heartbeat_update", {
 					heartbeat: heartbeat ?? null,
 				});
+			}
+
+			case "cycle_get": {
+				const state = this.getSessionState(command.activeSessionId);
+				const cycle = this.cronStore.getLatestCycle(state.activeSessionId);
+				return success(command.id, "cycle_get", { cycle: cycle ?? null });
+			}
+
+			case "cycle_set": {
+				const state = this.getSessionState(command.activeSessionId);
+				const cycle = this.createCycleForState(state, command.schedule);
+				return success(command.id, "cycle_set", { cycle });
+			}
+
+			case "cycle_update": {
+				const state = this.getSessionState(command.activeSessionId);
+				const cycle = this.updateCycleForState(state, command.action);
+				return success(command.id, "cycle_update", { cycle: cycle ?? null });
 			}
 
 			case "set_model": {

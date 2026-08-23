@@ -15,6 +15,7 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { AgentCycleUpdateAction } from "../../core/cycle.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -780,6 +781,39 @@ export class DaemonAgentConnection implements AgentConnection {
 			action,
 		});
 		return data.heartbeat ?? undefined;
+	}
+
+	supportsCycleAutomation(): boolean {
+		return this.client.supportsServerCapability("cycle_automation");
+	}
+
+	async getCycle(): Promise<AgentCronJob | undefined> {
+		const data = await this.requestData<{ cycle?: AgentCronJob | null }>({
+			type: "cycle_get",
+			activeSessionId: this.activeSessionId,
+		});
+		return data.cycle ?? undefined;
+	}
+
+	async setCycle(schedule: string): Promise<AgentCronJob> {
+		return this.withOwnedSessionPromotion(async (promoteOwnedSession) => {
+			const data = await this.requestData<{ cycle: AgentCronJob }>({
+				type: "cycle_set",
+				activeSessionId: this.activeSessionId,
+				schedule,
+				promoteOwnedSession,
+			});
+			return data.cycle;
+		});
+	}
+
+	async updateCycle(action: AgentCycleUpdateAction): Promise<AgentCronJob | undefined> {
+		const data = await this.requestData<{ cycle?: AgentCronJob | null }>({
+			type: "cycle_update",
+			activeSessionId: this.activeSessionId,
+			action,
+		});
+		return data.cycle ?? undefined;
 	}
 
 	async sendAgentMessage(targetActiveSessionId: string, message: string): Promise<AgentSessionMessageReceipt> {

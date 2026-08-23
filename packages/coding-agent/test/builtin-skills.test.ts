@@ -254,6 +254,14 @@ describe("builtin skills", () => {
 			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
 		});
 
+		it("loads the bundled Cycle owner contract as a markdown skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const cycleOwner = skills.find((skill) => skill.name === "cycle-owner");
+			expect(cycleOwner).toBeDefined();
+			expect(cycleOwner?.kind).toBe("markdown");
+		});
+
 		it("does not ship orchestration heartbeat as a built-in skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 

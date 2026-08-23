@@ -13,6 +13,7 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { AgentCycleUpdateAction } from "../../core/cycle.js";
 import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { AcpMcpServerConfig } from "../../core/mcp/acp-mcp-types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
@@ -286,6 +287,22 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async updateHeartbeat(_action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined> {
 		throw new Error("Heartbeats require daemon mode");
+	}
+
+	supportsCycleAutomation(): boolean {
+		return false;
+	}
+
+	async getCycle(): Promise<AgentCronJob | undefined> {
+		return undefined;
+	}
+
+	async setCycle(_schedule: string): Promise<AgentCronJob> {
+		throw new Error("Cycle automation requires daemon mode");
+	}
+
+	async updateCycle(_action: AgentCycleUpdateAction): Promise<AgentCronJob | undefined> {
+		throw new Error("Cycle automation requires daemon mode");
 	}
 
 	async sendAgentMessage(_targetActiveSessionId: string, _message: string): Promise<AgentSessionMessageReceipt> {

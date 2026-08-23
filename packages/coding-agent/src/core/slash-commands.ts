@@ -185,6 +185,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
 		takesArgument: true,
 	},
+	{
+		name: "cycle",
+		description: "Run persistent idle-anchored ownership rounds; supports pause, resume, run, stop, and status",
+		argumentHint: "[start <interval>|status|pause|resume|run|stop]",
+		takesArgument: true,
+	},
 	{ name: "heartbeats", description: "View and manage all user and agent heartbeats" },
 	{
 		name: "resume",
@@ -208,6 +214,7 @@ const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "thinking", aliasFor: "effort" },
 	{ name: "rename", aliasFor: "name" },
 	{ name: "side", aliasFor: "btw" },
+	{ name: "loop", aliasFor: "cycle" },
 ];
 
 function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {

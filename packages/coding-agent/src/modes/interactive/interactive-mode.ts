@@ -81,6 +81,13 @@ import {
 	DEFAULT_HEARTBEAT_DELIVERY_MODE,
 	parseHeartbeatCommand,
 } from "../../core/cron-jobs.js";
+import {
+	AGENT_CYCLE_MAX_CONSECUTIVE_FAILURES,
+	AGENT_CYCLE_MAX_DRY_ROUNDS,
+	AGENT_CYCLE_MAX_POST_REFLECTION_DRY_ROUNDS,
+	agentCyclePauseReasonText,
+	parseCycleCommand,
+} from "../../core/cycle.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -555,6 +562,15 @@ const HEARTBEAT_ARGUMENT_COMPLETIONS: AutocompleteItem[] = [
 		label: "--follow-up <instruction>",
 		description: "Deliver as a follow-up after the current turn finishes",
 	},
+];
+
+const CYCLE_ARGUMENT_COMPLETIONS: AutocompleteItem[] = [
+	{ value: "start ", label: "start <interval>", description: "Start or replace Cycle, for example /cycle 5m" },
+	{ value: "status", label: "status", description: "Show the current Cycle state" },
+	{ value: "pause", label: "pause", description: "Pause Cycle and preserve its round counters" },
+	{ value: "resume", label: "resume", description: "Resume Cycle and run the next round now" },
+	{ value: "run", label: "run", description: "Run the next active Cycle round now" },
+	{ value: "stop", label: "stop", description: "Stop the active Cycle" },
 ];
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -1297,6 +1313,11 @@ export class InteractiveMode {
 		if (heartbeatCommand) {
 			heartbeatCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
 				this.getHeartbeatArgumentCompletions(prefix);
+		}
+		const cycleCommand = slashCommands.find((command) => command.name === "cycle");
+		if (cycleCommand) {
+			cycleCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getCycleArgumentCompletions(prefix);
 		}
 
 		const connectionCommands = this.connectionCommands;
@@ -4762,6 +4783,11 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "cycle") {
+					await this.handleCycleCommand(canonicalCommandText);
+					this.editor.setText("");
+					return;
+				}
 				if (commandName === "heartbeat") {
 					await this.handleHeartbeatCommand(canonicalCommandText);
 					this.editor.setText("");
@@ -7942,6 +7968,16 @@ export class InteractiveMode {
 		return filtered.length === 0 ? null : filtered;
 	}
 
+	private getCycleArgumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const term = prefix.trim().toLowerCase();
+		const filtered = term
+			? CYCLE_ARGUMENT_COMPLETIONS.filter(
+					(item) => item.value.toLowerCase().startsWith(term) || item.label.toLowerCase().startsWith(term),
+				)
+			: CYCLE_ARGUMENT_COMPLETIONS;
+		return filtered.length === 0 ? null : filtered;
+	}
+
 	private currentModelSupportsFastMode(): boolean {
 		const model = this.getCurrentModel();
 		return model !== undefined && supportsFastMode(model);
@@ -9509,6 +9545,92 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
+	}
+
+	private async handleCycleCommand(text: string): Promise<void> {
+		const connection = this.agentConnection;
+		if (
+			connection.supportsCycleAutomation?.() !== true ||
+			!connection.getCycle ||
+			!connection.setCycle ||
+			!connection.updateCycle
+		) {
+			this.showError("Cycle automation requires daemon mode and a newer Prime Agent daemon.");
+			return;
+		}
+		const getCycle = connection.getCycle.bind(connection);
+		const setCycle = connection.setCycle.bind(connection);
+		const updateCycle = connection.updateCycle.bind(connection);
+		try {
+			const command = parseCycleCommand(text);
+			if (command.type === "help") {
+				this.showStatus(
+					[
+						"Usage: /cycle [start] <interval>",
+						"/cycle status|pause|resume|run|stop",
+						"Minimum interval: 30s; compound intervals such as 2h30m are supported.",
+						"Rounds start after the previous round has finished and the interval has elapsed.",
+						`Reflects after ${AGENT_CYCLE_MAX_DRY_ROUNDS} tool-free rounds, then pauses after ${AGENT_CYCLE_MAX_POST_REFLECTION_DRY_ROUNDS} further tool-free round.`,
+						`Stops after ${AGENT_CYCLE_MAX_CONSECUTIVE_FAILURES} consecutive failures.`,
+					].join("\n"),
+				);
+				return;
+			}
+			if (command.type === "status") {
+				const cycle = await getCycle();
+				this.showStatus(cycle ? this.formatCycleStatus(cycle) : "No active Cycle for this session.");
+				return;
+			}
+			if (command.type === "set") {
+				const cycle = await setCycle(command.schedule);
+				this.showStatus(
+					`Cycle started: ${command.intervalLabel}; first run ${cycle.nextRunAt ?? "-"}, then each round starts after the previous round completes.`,
+				);
+				return;
+			}
+			const cycle = await updateCycle(command.type);
+			if (!cycle) {
+				this.showStatus("No active Cycle for this session.");
+				return;
+			}
+			switch (command.type) {
+				case "pause":
+					this.showStatus(`Cycle paused after ${cycle.cycle?.rounds ?? 0} attempted rounds.`);
+					return;
+				case "resume":
+					this.showStatus("Cycle resumed; the next round will start now.");
+					return;
+				case "run":
+					this.showStatus("Cycle triggered; the next round will start now.");
+					return;
+				case "stop":
+					this.showStatus(`Cycle stopped after ${cycle.cycle?.rounds ?? 0} attempted rounds.`);
+					return;
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private formatCycleStatus(job: AgentCronJob): string {
+		const cycle = job.cycle;
+		if (!cycle) return "No active Cycle for this session.";
+		const details = [
+			`${cycle.rounds} rounds attempted`,
+			`${cycle.successfulRounds} succeeded`,
+			`${cycle.failedRounds} failed`,
+			cycle.interruptedRounds > 0 ? `${cycle.interruptedRounds} interrupted` : undefined,
+			cycle.consecutiveFailures > 0 ? `${cycle.consecutiveFailures} consecutive failures` : undefined,
+			cycle.postReflection
+				? `${cycle.consecutiveDryRounds}/${AGENT_CYCLE_MAX_POST_REFLECTION_DRY_ROUNDS} post-reflection tool-free rounds`
+				: cycle.consecutiveDryRounds > 0
+					? `${cycle.consecutiveDryRounds}/${AGENT_CYCLE_MAX_DRY_ROUNDS} tool-free rounds before reflection`
+					: undefined,
+			cycle.pauseReason ? `reason: ${agentCyclePauseReasonText(cycle.pauseReason)}` : undefined,
+			cycle.lastError ? `last error: ${cycle.lastError}` : undefined,
+			job.nextRunAt ? `next run: ${job.nextRunAt}` : undefined,
+		].filter((part): part is string => part !== undefined);
+		return `Cycle ${job.status}: ${job.schedule.expression}; ${details.join(", ")}`;
 	}
 
 	private async handleHeartbeatCommand(text: string): Promise<void> {

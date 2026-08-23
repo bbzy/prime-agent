@@ -225,6 +225,9 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"heartbeat_get",
 	"heartbeat_set",
 	"heartbeat_update",
+	"cycle_get",
+	"cycle_set",
+	"cycle_update",
 	"set_model",
 	"cycle_model",
 	"set_scoped_models",
@@ -1981,6 +1984,14 @@ export class DaemonSupervisor {
 			case "heartbeat_update": {
 				const match = await this.findWorkerForClient(client, command.activeSessionId);
 				return this.forwardToWorker(match.worker, command);
+			}
+			case "cycle_set": {
+				const match = await this.findWorkerForClient(client, command.activeSessionId);
+				const response = await this.forwardToWorker(match.worker, command);
+				if (response.success && command.promoteOwnedSession) {
+					await this.promoteOwnedWorker(client, match.worker);
+				}
+				return response;
 			}
 			case "rename_saved_session": {
 				const target = await this.savedSessionNameReservationInput(command.sessionPath, command.name.trim());

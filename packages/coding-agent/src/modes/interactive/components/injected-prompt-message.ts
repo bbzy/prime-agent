@@ -147,6 +147,12 @@ export class InjectedPromptMessageComponent extends Container {
 
 	private heartbeatHeaderText(): string {
 		const details = this.message.details as HeartbeatPromptDetails | undefined;
+		if (details?.source === "cycle") {
+			const round = details.cycleRound === undefined ? "" : ` #${details.cycleRound}`;
+			const schedule = theme.fg("muted", heartbeatPromptSchedule(details.schedule));
+			const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;
+			return `${theme.fg("muted", `Cycle${round}`)}${theme.fg("dim", " · ")}${schedule}${theme.fg("dim", hint)}`;
+		}
 		const pulse = theme.fg("error", "♥");
 		const schedule = theme.fg("muted", heartbeatPromptSchedule(details?.schedule));
 		const hint = this.expanded ? "" : ` ${expandCollapseHint("app.tools.expand", false)}`;

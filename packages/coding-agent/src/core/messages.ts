@@ -175,6 +175,8 @@ export interface HeartbeatPromptDetails {
 	schedule: string;
 	status: AgentCronJob["status"];
 	runCount: number;
+	source?: AgentCronJob["source"];
+	cycleRound?: number;
 	nextRunAt?: string;
 	lastRunAt?: string;
 }
@@ -469,6 +471,8 @@ export function createHeartbeatPromptMessage(
 			schedule: job.schedule.expression,
 			status: job.status,
 			runCount: job.runCount,
+			source: job.source,
+			cycleRound: job.cycle ? job.cycle.rounds + 1 : undefined,
 			nextRunAt: job.nextRunAt,
 			lastRunAt: job.lastRunAt,
 		},

@@ -11,11 +11,23 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { lockSync } from "proper-lockfile";
+import {
+	type AgentCycleRoundObservation,
+	type AgentCycleState,
+	type AgentCycleUpdateAction,
+	advanceAgentCycle,
+	createInitialAgentCycleState,
+	DEFAULT_AGENT_CYCLE_PROMPT,
+	isAgentCycleReflectionRound,
+	isAgentCycleState,
+	parseAgentCycleSchedule,
+	resetAgentCycleLiveness,
+} from "./cycle.js";
 import { getSessionArtifactPathForFile } from "./session-manager.js";
 
 export type AgentCronJobStatus = "active" | "paused" | "completed" | "cancelled";
 export type AgentCronScheduleKind = "once" | "cron" | "interval";
-export type AgentCronJobSource = "cron" | "heartbeat" | "rlm_heartbeat";
+export type AgentCronJobSource = "cron" | "heartbeat" | "rlm_heartbeat" | "cycle";
 export type AgentCronJobRuntimeKind = "top-level" | "subagent";
 export type AgentHeartbeatUpdateAction = "pause" | "resume" | "clear";
 export type AgentHeartbeatManagementAction = "pause" | "resume" | "stop";
@@ -53,6 +65,7 @@ export interface AgentCronJob {
 	lastSkippedAt?: string;
 	lastError?: string;
 	runCount: number;
+	cycle?: AgentCycleState;
 }
 
 export interface CreateAgentCronJobInput {
@@ -308,6 +321,61 @@ export class AgentCronJobStore {
 		return this.readJobs()
 			.filter((job) => job.activeSessionId === activeSessionId && job.source === "heartbeat")
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+	}
+
+	getCycle(activeSessionId: string): AgentCronJob | undefined {
+		return this.readJobs()
+			.filter(
+				(job) =>
+					job.activeSessionId === activeSessionId &&
+					job.source === "cycle" &&
+					(job.status === "active" || job.status === "paused"),
+			)
+			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+	}
+
+	getLatestCycle(activeSessionId: string): AgentCronJob | undefined {
+		const cycles = this.readJobs().filter((job) => job.activeSessionId === activeSessionId && job.source === "cycle");
+		const current = cycles
+			.filter((job) => job.status === "active" || job.status === "paused")
+			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+		return current ?? cycles.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+	}
+
+	createCycle(input: Omit<CreateAgentCronJobInput, "prompt" | "source" | "deliveryMode">): AgentCronJob {
+		const now = input.now ?? new Date();
+		const parsed = parseAgentCycleSchedule(input.scheduleText, now);
+		const nowIso = now.toISOString();
+		const existing = this.readJobs().map((job) => {
+			if (
+				job.activeSessionId === input.activeSessionId &&
+				job.source === "cycle" &&
+				(job.status === "active" || job.status === "paused")
+			) {
+				return withoutNextRunAt({ ...job, status: "cancelled" as const, updatedAt: nowIso });
+			}
+			return job;
+		});
+		const job: AgentCronJob = {
+			id: randomUUID(),
+			status: "active",
+			source: "cycle",
+			runtimeKind: input.runtimeKind,
+			activeSessionId: input.activeSessionId,
+			sessionId: input.sessionId,
+			sessionFile: input.sessionFile,
+			cwd: input.cwd,
+			label: normalizeOptionalLabel(input.label),
+			prompt: DEFAULT_AGENT_CYCLE_PROMPT,
+			schedule: parsed.schedule,
+			createdAt: nowIso,
+			updatedAt: nowIso,
+			nextRunAt: parsed.nextRunAt.toISOString(),
+			runCount: 0,
+			cycle: createInitialAgentCycleState(now),
+		};
+		this.writeJobs([...existing, job]);
+		return job;
 	}
 
 	createHeartbeat(input: CreateAgentCronJobInput): AgentCronJob {
@@ -619,6 +687,100 @@ export class AgentCronJobStore {
 		return updated;
 	}
 
+	updateCycle(activeSessionId: string, action: AgentCycleUpdateAction, now = new Date()): AgentCronJob | undefined {
+		const current = this.getCycle(activeSessionId);
+		if (!current?.cycle) return undefined;
+		if (action === "run" && current.status === "paused") {
+			throw new Error("Cycle is paused. Use /cycle resume first.");
+		}
+		if (action === "resume" && current.status !== "paused") {
+			throw new Error("Cycle is not paused.");
+		}
+		if (action === "pause" && current.status === "paused") return current;
+		let updated: AgentCronJob | undefined;
+		const jobs = this.readJobs().map((job) => {
+			if (job.id !== current.id || !job.cycle) return job;
+			const updatedAt = now.toISOString();
+			if (action === "pause") {
+				updated = withoutNextRunAt({
+					...job,
+					status: "paused",
+					cycle: { ...job.cycle, pauseReason: "user_paused" },
+					updatedAt,
+				});
+				return updated;
+			}
+			if (action === "stop") {
+				updated = withoutNextRunAt({ ...job, status: "cancelled", updatedAt });
+				return updated;
+			}
+			if (action === "resume") {
+				updated = {
+					...job,
+					status: "active",
+					cycle: resetAgentCycleLiveness(job.cycle),
+					nextRunAt: updatedAt,
+					updatedAt,
+				};
+				return updated;
+			}
+			updated = { ...job, nextRunAt: updatedAt, updatedAt };
+			return updated;
+		});
+		if (updated) this.writeJobs(jobs);
+		return updated;
+	}
+
+	pauseCycleForUserIntervention(activeSessionId: string, now = new Date()): AgentCronJob | undefined {
+		const current = this.getCycle(activeSessionId);
+		if (!current?.cycle || current.status !== "active") return current;
+		let paused: AgentCronJob | undefined;
+		const jobs = this.readJobs().map((job) => {
+			if (job.id !== current.id || !job.cycle) return job;
+			paused = withoutNextRunAt({
+				...job,
+				status: "paused",
+				cycle: { ...job.cycle, pauseReason: "user_intervention" },
+				updatedAt: now.toISOString(),
+			});
+			return paused;
+		});
+		if (paused) this.writeJobs(jobs);
+		return paused;
+	}
+
+	recordCycleRound(id: string, observation: AgentCycleRoundObservation, now = new Date()): AgentCronJob | undefined {
+		let updated: AgentCronJob | undefined;
+		this.mutateStates((state) => {
+			state.jobs = state.jobs.map((job) => {
+				if (job.id !== id || job.source !== "cycle" || !job.cycle) return job;
+				const userIntervened = job.status === "paused" && job.cycle.pauseReason === "user_intervention";
+				const transition = advanceAgentCycle(
+					job.cycle,
+					userIntervened
+						? {
+								kind: "interrupted",
+								reason: "user_intervention",
+								reflection: isAgentCycleReflectionRound(job.cycle),
+							}
+						: observation,
+				);
+				const preservePause = job.status === "paused";
+				const next = {
+					...job,
+					status: preservePause ? ("paused" as const) : transition.status,
+					cycle: preservePause ? { ...transition.cycle, pauseReason: job.cycle.pauseReason } : transition.cycle,
+					lastError: transition.cycle.lastError,
+					updatedAt: now.toISOString(),
+				};
+				updated = next.status === "active" ? next : withoutNextRunAt(next);
+				return updated;
+			});
+			return [];
+		});
+		return updated;
+	}
+
 	cancel(id: string, now = new Date()): AgentCronJob | undefined {
 		let cancelled: AgentCronJob | undefined;
 		const jobs = this.readJobs().map((job) => {
@@ -726,9 +888,55 @@ export class AgentCronJobStore {
 			const now = result.now ?? new Date();
 			state.dispatches = state.dispatches.filter((candidate) => candidate.id !== dispatchId);
 			state.jobs = state.jobs.map((job) => {
-				if (job.id !== dispatch.jobId || job.status !== "active") {
+				if (job.id !== dispatch.jobId) {
 					return job;
 				}
+				if (job.source === "cycle" && job.cycle) {
+					let cycleJob: AgentCronJob & { source: "cycle"; cycle: AgentCycleState } = {
+						...job,
+						source: "cycle",
+						cycle: job.cycle,
+					};
+					if (result.error !== undefined && cycleJob.status === "active") {
+						const transition = advanceAgentCycle(cycleJob.cycle, {
+							kind: "failure",
+							error: errorMessage(result.error),
+							reflection: isAgentCycleReflectionRound(cycleJob.cycle),
+						});
+						cycleJob = {
+							...cycleJob,
+							status: transition.status,
+							cycle: transition.cycle,
+							lastError: transition.cycle.lastError,
+						};
+					}
+					if (result.outcome === "skipped" && result.error === undefined) {
+						if (cycleJob.status !== "active") return cycleJob;
+						const nextRunAt = nextRunAtForSchedule(cycleJob.schedule, now);
+						updated = {
+							...cycleJob,
+							nextRunAt: nextRunAt?.toISOString(),
+							lastSkippedAt: now.toISOString(),
+							updatedAt: now.toISOString(),
+						};
+						return updated;
+					}
+					const nextRunAt =
+						cycleJob.status === "active" ? nextRunAtForSchedule(cycleJob.schedule, now) : undefined;
+					const next = {
+						...cycleJob,
+						lastRunAt: now.toISOString(),
+						lastError:
+							result.error === undefined
+								? cycleJob.cycle.lastError
+								: (cycleJob.cycle.lastError ?? errorMessage(result.error)),
+						runCount: cycleJob.runCount + 1,
+						updatedAt: now.toISOString(),
+					};
+					updated = nextRunAt ? { ...next, nextRunAt: nextRunAt.toISOString() } : withoutNextRunAt(next);
+					return updated;
+				}
+				if (job.status !== "active") return job;
 				if (result.outcome === "skipped" && result.error === undefined) {
 					const nextRunAt = nextRunAtForSchedule(job.schedule, now);
 					updated = {
@@ -1026,6 +1234,7 @@ export class AgentCronScheduler {
 						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
 						error,
 					});
+					if (!this.stopped) this.scheduleNext();
 					return runResult;
 				} finally {
 					endDispatch?.();
@@ -1347,6 +1556,10 @@ export function isHeartbeatCronJob(job: AgentCronJob): boolean {
 	return job.source === "heartbeat" || job.source === "rlm_heartbeat";
 }
 
+export function isCycleCronJob(job: AgentCronJob): job is AgentCronJob & { source: "cycle"; cycle: AgentCycleState } {
+	return job.source === "cycle" && job.cycle !== undefined;
+}
+
 export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: HeartbeatCronSessionActivity): boolean {
 	if (!isHeartbeatCronJob(job)) {
 		return false;
@@ -1578,7 +1791,8 @@ function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): Ag
 			return job;
 		}
 		const scheduledFor = job.nextRunAt!;
-		const nextRunAt = nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString();
+		const nextRunAt =
+			job.source === "cycle" ? undefined : nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString();
 		const advanced = nextRunAt
 			? { ...job, nextRunAt, updatedAt: claimedAt.toISOString() }
 			: withoutNextRunAt({ ...job, updatedAt: claimedAt.toISOString() });
@@ -1615,6 +1829,23 @@ function recoverInterruptedInState(
 	state.jobs = state.jobs.map((job) => {
 		if (!interruptedIds.has(job.id) || job.status !== "active") {
 			return job;
+		}
+		if (job.source === "cycle" && job.cycle) {
+			const nextRunAt = nextRunAtForSchedule(job.schedule, now);
+			const next: AgentCronJob = {
+				...job,
+				cycle: {
+					...job.cycle,
+					rounds: job.cycle.rounds + 1,
+					interruptedRounds: job.cycle.interruptedRounds + 1,
+					lastOutcome: "interrupted",
+				},
+				nextRunAt: nextRunAt?.toISOString(),
+				lastError: "Interrupted before Cycle round completion",
+				updatedAt: now.toISOString(),
+			};
+			recovered.push(next);
+			return next;
 		}
 		const next = {
 			...job,
@@ -1694,7 +1925,8 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		(candidate.source === undefined ||
 			candidate.source === "cron" ||
 			candidate.source === "heartbeat" ||
-			candidate.source === "rlm_heartbeat") &&
+			candidate.source === "rlm_heartbeat" ||
+			candidate.source === "cycle") &&
 		(candidate.runtimeKind === undefined ||
 			candidate.runtimeKind === "top-level" ||
 			candidate.runtimeKind === "subagent") &&
@@ -1717,7 +1949,8 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.schedule.expression === "string" &&
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
-		typeof candidate.runCount === "number"
+		typeof candidate.runCount === "number" &&
+		(candidate.source === "cycle" ? isAgentCycleState(candidate.cycle) : candidate.cycle === undefined)
 	);
 }
 

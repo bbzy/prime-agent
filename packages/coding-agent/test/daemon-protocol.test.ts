@@ -119,6 +119,22 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("capability- and schema-gates Cycle automation while preserving legacy cron commands", () => {
+		const compatibility = {
+			minProtocol: 7,
+			minSchemaRevision: 23,
+			capability: "cycle_automation",
+		};
+		expect(DAEMON_COMMAND_COMPATIBILITY.cycle_get).toEqual(compatibility);
+		expect(DAEMON_COMMAND_COMPATIBILITY.cycle_set).toEqual(compatibility);
+		expect(DAEMON_COMMAND_COMPATIBILITY.cycle_update).toEqual(compatibility);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("cycle_automation");
+		expect(DAEMON_COMMAND_COMPATIBILITY.cron_list).toEqual({ minProtocol: 7 });
+		expect(isDaemonMutatingCommand({ type: "cycle_get" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "cycle_set" })).toBe(true);
+		expect(isDaemonMutatingCommand({ type: "cycle_update" })).toBe(true);
+	});
+
 	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.delete_rlm_subagent).toEqual({
 			minProtocol: 7,

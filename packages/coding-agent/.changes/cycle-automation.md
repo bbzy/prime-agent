@@ -1,0 +1,1 @@
+- Added persistent daemon-backed Cycle automation with completion-anchored rounds, restart recovery, and automatic safety pauses.
